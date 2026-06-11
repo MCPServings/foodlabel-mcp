@@ -16,8 +16,17 @@
 """
 from __future__ import annotations
 
+import json
+
 from . import llm
-from .standards import CHECKLIST, analyze_system, eval_system
+from .standards import (
+    CHECKLIST,
+    analyze_system,
+    applicable_for,
+    category_info,
+    extract_system,
+    rules_system,
+)
 
 # 允许的图片 MIME 类型。
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"}
@@ -41,13 +50,24 @@ async def check_image_bytes(
     max_bytes: int = DEFAULT_MAX_BYTES,
     allowed_types: set[str] | None = None,
 ) -> dict:
-    """从原始图片字节开始的完整检查流程，返回规范化后的合规报告。"""
+    """从原始图片字节开始的完整检查流程，返回规范化后的合规报告（非流式）。"""
+    data_urls = prepare_items(items, max_images=max_images, max_bytes=max_bytes, allowed_types=allowed_types)
+    return await analyze_data_urls(data_urls)
+
+
+def prepare_items(
+    items: list[tuple[bytes, str | None]],
+    *,
+    max_images: int = DEFAULT_MAX_IMAGES,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    allowed_types: set[str] | None = None,
+) -> list[str]:
+    """校验图片字节并转成 data URL 列表（校验失败抛 InputError）。"""
     allowed = allowed_types or ALLOWED_TYPES
     if not items:
         raise InputError("请至少上传一张标签图片。")
     if len(items) > max_images:
         raise InputError(f"最多一次上传 {max_images} 张图片。")
-
     data_urls: list[str] = []
     for raw, ctype in items:
         if not raw:
@@ -58,24 +78,29 @@ async def check_image_bytes(
         if ct and ct not in allowed:
             raise InputError(f"不支持的图片格式：{ct}")
         data_urls.append(llm.prepare_image(raw, ct or None))
-
     if not data_urls:
         raise InputError("上传的图片为空。")
-    return await analyze_data_urls(data_urls)
+    return data_urls
 
 
-async def analyze_data_urls(data_urls: list[str]) -> dict:
-    """三段式流程：双 OCR 并行 → R1 评价融合 → R1 国标比对 → 规范化。"""
+async def analyze_steps(data_urls: list[str]):
+    """分步异步生成器：逐步产出阶段事件，供 SSE 流式逐步返回。
+
+    依次 yield 形如 {"step": <编号>, "stage": <名>, "status": started|done, ...} 的事件：
+      1 ocr      OCR 识别（DeepSeek-OCR）
+      2 extract  视觉识读字段 + 营养表（Qwen3.6 看图提取）
+      3 analyze  对照国标合规分析（Qwen3.6 基于字段判定）
+      4 done     汇总最终报告
+    每个 done 事件携带该步的数据；前端据此点亮进度条并逐步渲染。
+    """
     if not data_urls:
         raise InputError("没有可分析的图片。")
 
-    # 1) 多 OCR 模型并行识别（对每张图都跑；多图时各图结果按模型拼接）。
-    per_image = []
-    for url in data_urls:
-        per_image.append(await llm.ocr_all(url))
-    # 汇总成 [{model, text, error}]，多图时同模型文本用分隔符拼接。
+    # ── 步骤 1：OCR 识别 ──
+    yield {"step": 1, "stage": "ocr", "status": "started", "label": "识别图片"}
+    per_image = [await llm.ocr_all(url) for url in data_urls]
     ocr_results: list[dict] = []
-    for idx, model in enumerate(llm.OCR_MODELS):
+    for model in llm.OCR_MODELS:
         texts, errs = [], []
         for img_res in per_image:
             r = next((x for x in img_res if x["model"] == model), None)
@@ -85,67 +110,116 @@ async def analyze_data_urls(data_urls: list[str]) -> dict:
                 errs.append(r["error"])
             if r.get("text"):
                 texts.append(r["text"])
-        ocr_results.append(
-            {
-                "model": model,
-                "text": "\n\n---\n\n".join(texts),
-                "error": "; ".join(errs) if errs and not texts else None,
-            }
-        )
+        ocr_results.append({
+            "model": model,
+            "text": "\n\n---\n\n".join(texts),
+            "error": "; ".join(errs) if errs and not texts else None,
+        })
+    ocr_draft = "\n\n".join(r["text"] for r in ocr_results if r["text"])
+    yield {"step": 1, "stage": "ocr", "status": "done", "ocr_results": ocr_results}
 
-    if not any(r["text"] for r in ocr_results):
-        # 所有 OCR 都失败：仍可让视觉模型仅凭原图分析（OCR 文本留空）。
-        merged_text = ""
-    else:
-        valid = [r for r in ocr_results if r["text"]]
-        if len(valid) >= 2:
-            # 多个 OCR：先让 reason 模型评价并融合最佳文本。
-            eval_user = "以下是同一张食品标签图片的多个 OCR 识别结果：\n\n" + "\n\n".join(
-                f"【{r['model']}】\n{r['text']}" for r in valid
-            )
-            evaluation = await llm.reason_json(eval_system(), eval_user)
-            merged_text = (evaluation.get("merged_text") or "").strip() or max(
-                (r["text"] for r in valid), key=len, default=""
-            )
-        else:
-            merged_text = valid[0]["text"]
-
-    # 评价信息（单 OCR 时不互评）。
-    evaluation = locals().get("evaluation") or {
-        "evaluations": [
-            {"model": r["model"], "score": None,
-             "comment": "OCR 文本作为草稿，由视觉模型对照原图复核。" if r["text"] else (r.get("error") or "无输出")}
-            for r in ocr_results
-        ],
-        "confidence": None,
-    }
-
-    # 3) 把 OCR 草稿文本 + 原图 一起喂给视觉推理模型：以图为准核对文本，再逐条对照国标。
-    analyze_user = (
-        "你将看到一件预包装食品标签的原始照片，以及 OCR 初步识别出的文本草稿。\n"
-        "请以原图为准，先核对/补全文本（OCR 可能有错漏），再逐条对照国家标准进行合规分析。\n\n"
-        "OCR 文本草稿：\n" + (merged_text or "（OCR 未识别出文本，请完全以图片为准）")
+    # ── 步骤 2：视觉识读字段 + 营养表 ──
+    yield {"step": 2, "stage": "extract", "status": "started", "label": "识读内容"}
+    extract_user = (
+        "请识读这张食品标签，输出结构化字段 JSON。"
+        + ("\n\n供参考的 OCR 文本草稿：\n" + ocr_draft if ocr_draft else "")
     )
-    analysis = await llm.reason_json(analyze_system(), analyze_user, images=data_urls)
-
-    result = normalize(analysis)
-    # 若视觉模型回填了更完整的 extracted，可据此覆盖 merged_text 供前端展示。
-    if not merged_text:
-        ex = result.get("extracted") or {}
-        merged_text = ex.get("other_text") or ""
-    # 附上 OCR 原文与评价，供前端展示「识别过程」。
-    result["ocr_results"] = ocr_results
-    result["ocr_evaluation"] = {
-        "evaluations": evaluation.get("evaluations", []),
-        "confidence": evaluation.get("confidence"),
+    extracted_doc = await llm.reason_json(extract_system(), extract_user, images=data_urls)
+    extracted = extracted_doc.get("extracted") or {}
+    is_label = extracted_doc.get("is_food_label")
+    label_type = extracted_doc.get("label_type", "")
+    yield {
+        "step": 2, "stage": "extract", "status": "done",
+        "is_food_label": is_label, "label_type": label_type,
+        "extracted": extracted, "ocr_results": ocr_results,
     }
-    result["merged_text"] = merged_text
-    return result
+
+    # 明显不是食品标签：直接收尾，不做合规分析。
+    if is_label is False:
+        result = normalize({
+            "is_food_label": False, "label_type": label_type,
+            "extracted": extracted, "checks": [],
+            "summary": {"verdict": "not_a_label", "score": 0},
+        })
+        result["ocr_results"] = ocr_results
+        yield {"step": 5, "stage": "done", "status": "done", "result": result}
+        return
+
+    # ── 步骤 3：判定适用规则（LLM 只做受限分类 → 代码确定性映射出适用条目）──
+    yield {"step": 3, "stage": "rules", "status": "started", "label": "判定适用规则"}
+    rules_user = "以下是某预包装食品标签已识读出的结构化字段（JSON）：\n\n" + json.dumps(
+        {"label_type": label_type, "extracted": extracted}, ensure_ascii=False
+    )
+    rules_doc = await llm.reason_json(rules_system(), rules_user)
+    category_id = rules_doc.get("category_id") or "general"
+    is_import = bool(rules_doc.get("is_import"))
+    scope = "import" if is_import else "domestic"
+    # 适用条目由代码按固定映射确定性算出（非 LLM 自由判断）。
+    applicable = applicable_for(category_id, scope)
+    cat = category_info(category_id)
+    rules_meta = {
+        "category_id": category_id,
+        "category_name": cat.get("name", ""),
+        "category_basis": cat.get("basis", ""),
+        "category_reason": rules_doc.get("category_reason", ""),
+        "is_import": is_import,
+        "applicable": [
+            {"id": cid, "item": _ITEM_BY_ID[cid], "applicable": a["applicable"],
+             "reason": a["reason"], "basis": a["basis"]}
+            for cid, a in applicable.items()
+        ],
+    }
+    yield {"step": 3, "stage": "rules", "status": "done", "rules": rules_meta}
+
+    # ── 步骤 4：基于适用规则做合规评价（缺失/问题/风险）──
+    yield {"step": 4, "stage": "analyze", "status": "started", "label": "合规评价"}
+    applicable_text = "\n".join(
+        f"- {a['id']}（{_ITEM_BY_ID[a['id']]}）：{'适用' if a['applicable'] else '不适用→判 na'}（{a['reason']}）"
+        for a in applicable_list(applicable)
+    )
+    analyze_user = (
+        "食品类目：" + cat.get("name", "") + "（" + cat.get("basis", "") + "）\n"
+        "适用规则（不适用项一律判 na，不计入缺失/问题）：\n" + applicable_text + "\n\n"
+        "已识读出的结构化字段（JSON）：\n" + json.dumps(
+            {"label_type": label_type, "extracted": extracted}, ensure_ascii=False
+        )
+    )
+    analysis = await llm.reason_json(analyze_system(), analyze_user)
+    analysis.setdefault("extracted", extracted)
+    analysis.setdefault("is_food_label", is_label)
+    analysis.setdefault("label_type", label_type)
+    result = normalize(analysis, applicable=applicable)
+    result["ocr_results"] = ocr_results
+    result["rules"] = rules_meta
+
+    # ── 步骤 5：汇总报告 ──
+    yield {"step": 5, "stage": "done", "status": "done", "result": result}
 
 
+async def analyze_data_urls(data_urls: list[str]) -> dict:
+    """非流式封装：跑完分步流程，返回最终报告（供 MCP / 一次性调用）。"""
+    if not data_urls:
+        raise InputError("没有可分析的图片。")
+    final: dict | None = None
+    async for ev in analyze_steps(data_urls):
+        if ev.get("stage") == "done":
+            final = ev.get("result")
+    if final is None:
+        raise llm.LLMError("分析未产出结果。")
+    return final
 
-def normalize(result: dict) -> dict:
-    """对模型输出做轻量校正：补全检查项与计数，保证字段存在，便于稳定渲染。"""
+
+def applicable_list(applicable: dict[str, dict]) -> list[dict]:
+    """把 applicable_for 的 dict 转成保持 CHECKLIST 顺序的列表。"""
+    return [{"id": c["id"], **applicable[c["id"]]} for c in CHECKLIST if c["id"] in applicable]
+
+
+def normalize(result: dict, applicable: dict[str, dict] | None = None) -> dict:
+    """对模型输出做轻量校正：补全检查项与计数，保证字段存在，便于稳定渲染。
+
+    若给出 applicable（适用规则映射），则**确定性地**把不适用项强制判为 na，
+    覆盖 LLM 的判定，保证适用范围严格符合国标条款。
+    """
     if not isinstance(result, dict):
         return {"error": "模型返回格式异常。"}
     checks = result.get("checks") or []
@@ -168,6 +242,13 @@ def normalize(result: dict) -> dict:
                     "basis": _BASIS_BY_ID[cid],
                 }
             )
+    # 确定性应用适用规则：不适用项强制 na（覆盖 LLM）。
+    if applicable:
+        for c in checks:
+            rule = applicable.get(c.get("id"))
+            if rule and not rule.get("applicable", True):
+                c["status"] = "na"
+                c["finding"] = rule.get("reason", "该项对本商品不适用")
     counts = {"pass": 0, "fail": 0, "warn": 0, "na": 0, "unknown": 0}
     for c in checks:
         st = str(c.get("status", "unknown")).lower()
