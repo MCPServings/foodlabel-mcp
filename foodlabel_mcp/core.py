@@ -94,26 +94,45 @@ async def analyze_data_urls(data_urls: list[str]) -> dict:
         )
 
     if not any(r["text"] for r in ocr_results):
-        # 所有 OCR 都失败：直接报错，附带各自的错误。
-        detail = "; ".join(f"{r['model']}: {r['error']}" for r in ocr_results if r.get("error"))
-        raise llm.LLMError(f"OCR 全部失败：{detail or '无文本'}")
+        # 所有 OCR 都失败：仍可让视觉模型仅凭原图分析（OCR 文本留空）。
+        merged_text = ""
+    else:
+        valid = [r for r in ocr_results if r["text"]]
+        if len(valid) >= 2:
+            # 多个 OCR：先让 reason 模型评价并融合最佳文本。
+            eval_user = "以下是同一张食品标签图片的多个 OCR 识别结果：\n\n" + "\n\n".join(
+                f"【{r['model']}】\n{r['text']}" for r in valid
+            )
+            evaluation = await llm.reason_json(eval_system(), eval_user)
+            merged_text = (evaluation.get("merged_text") or "").strip() or max(
+                (r["text"] for r in valid), key=len, default=""
+            )
+        else:
+            merged_text = valid[0]["text"]
 
-    # 2) R1 评价各 OCR 结果并融合最佳文本。
-    eval_user = "以下是同一张食品标签图片的多个 OCR 识别结果：\n\n" + "\n\n".join(
-        f"【{r['model']}】\n{r['text'] or '(无输出' + (' / ' + r['error'] if r.get('error') else '') + ')'}"
-        for r in ocr_results
+    # 评价信息（单 OCR 时不互评）。
+    evaluation = locals().get("evaluation") or {
+        "evaluations": [
+            {"model": r["model"], "score": None,
+             "comment": "OCR 文本作为草稿，由视觉模型对照原图复核。" if r["text"] else (r.get("error") or "无输出")}
+            for r in ocr_results
+        ],
+        "confidence": None,
+    }
+
+    # 3) 把 OCR 草稿文本 + 原图 一起喂给视觉推理模型：以图为准核对文本，再逐条对照国标。
+    analyze_user = (
+        "你将看到一件预包装食品标签的原始照片，以及 OCR 初步识别出的文本草稿。\n"
+        "请以原图为准，先核对/补全文本（OCR 可能有错漏），再逐条对照国家标准进行合规分析。\n\n"
+        "OCR 文本草稿：\n" + (merged_text or "（OCR 未识别出文本，请完全以图片为准）")
     )
-    evaluation = await llm.reason_json(eval_system(), eval_user, max_tokens=4000)
-    merged_text = (evaluation.get("merged_text") or "").strip()
-    if not merged_text:
-        # 评价模型没给融合文本时，退而用最长的一份 OCR 文本。
-        merged_text = max((r["text"] for r in ocr_results), key=len, default="")
-
-    # 3) R1 对融合文本逐条对照国标，输出 checks 与 缺失/问题/风险点。
-    analyze_user = "以下是某预包装食品标签识别出的文本，请逐条对照国家标准进行合规分析：\n\n" + merged_text
-    analysis = await llm.reason_json(analyze_system(), analyze_user, max_tokens=6000)
+    analysis = await llm.reason_json(analyze_system(), analyze_user, images=data_urls)
 
     result = normalize(analysis)
+    # 若视觉模型回填了更完整的 extracted，可据此覆盖 merged_text 供前端展示。
+    if not merged_text:
+        ex = result.get("extracted") or {}
+        merged_text = ex.get("other_text") or ""
     # 附上 OCR 原文与评价，供前端展示「识别过程」。
     result["ocr_results"] = ocr_results
     result["ocr_evaluation"] = {
@@ -133,7 +152,10 @@ def normalize(result: dict) -> dict:
     if not isinstance(checks, list):
         checks = []
     seen = {c.get("id") for c in checks if isinstance(c, dict)}
-    # 模型漏判的检查项补成 unknown，保证清单完整。
+    # 模型只列出有问题/不适用的项；未列出的视为合规（pass）。
+    # 但若整图不是食品标签，则补成 unknown（无从判定）。
+    fill_status = "unknown" if result.get("is_food_label") is False else "pass"
+    fill_finding = "模型未列为问题项。" if fill_status == "pass" else "非食品标签，无法判定。"
     for cid in _CHECK_IDS:
         if cid not in seen:
             checks.append(
@@ -141,8 +163,8 @@ def normalize(result: dict) -> dict:
                     "id": cid,
                     "category": _CAT_BY_ID[cid],
                     "item": _ITEM_BY_ID[cid],
-                    "status": "unknown",
-                    "finding": "模型未给出该项判定。",
+                    "status": fill_status,
+                    "finding": fill_finding,
                     "basis": _BASIS_BY_ID[cid],
                 }
             )

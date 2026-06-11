@@ -1,16 +1,18 @@
-"""硅基流动（SiliconFlow）多模型客户端.
+"""多模型客户端：OCR 走硅基流动，评价/比对走天枢（均 OpenAI 兼容）.
 
-封装三类调用，全部走硅基流动 OpenAI 兼容接口：
+封装两类调用：
 
-  * ocr_all(image)        并行跑多个 OCR 视觉模型（PaddleOCR-VL-1.5 / DeepSeek-OCR）
-  * reason_json(...)      用 DeepSeek-R1-0528-Qwen3-8B 做评价 / 条文比对，返回 JSON
+  * ocr_all(image)        并行跑多个 OCR 视觉模型（硅基流动 PaddleOCR-VL-1.5 / DeepSeek-OCR）
+  * reason_json(...)      用评价/比对模型做返回 JSON 的调用（默认 4090 接口 Qwen3.6-35B-A3B）
 
 配置（环境变量）：
-    SF_BASE_URL     默认 https://api.siliconflow.cn/v1
-    SF_API_KEY      硅基流动 key（必填）
-    SF_OCR_MODELS   逗号分隔的 OCR 模型，默认 PaddlePaddle/PaddleOCR-VL-1.5,deepseek-ai/DeepSeek-OCR
-    SF_REASON_MODEL 评价/分析模型，默认 deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
-    SF_TIMEOUT      秒，默认 120
+    SF_BASE_URL        OCR 网关，默认 https://api.siliconflow.cn/v1
+    SF_API_KEY         OCR 网关 key（硅基流动，必填）
+    SF_OCR_MODELS      逗号分隔的 OCR 模型，默认 PaddlePaddle/PaddleOCR-VL-1.5,deepseek-ai/DeepSeek-OCR
+    SF_REASON_MODEL    评价/比对模型，默认 Qwen3.6-35B-A3B
+    SF_REASON_BASE_URL 评价/比对网关，默认 http://127.0.0.1:17590/v1（tencent 反向隧道→4090 AMD 网关）
+    SF_REASON_API_KEY  评价/比对网关 key；留空则回落用 SF_API_KEY/SF_BASE_URL
+    SF_TIMEOUT         秒，默认 120
 """
 from __future__ import annotations
 
@@ -28,11 +30,15 @@ SF_API_KEY = os.getenv("SF_API_KEY", "")
 OCR_MODELS = [
     m.strip()
     for m in os.getenv(
-        "SF_OCR_MODELS", "PaddlePaddle/PaddleOCR-VL-1.5,deepseek-ai/DeepSeek-OCR"
+        "SF_OCR_MODELS", "deepseek-ai/DeepSeek-OCR"
     ).split(",")
     if m.strip()
 ]
-REASON_MODEL = os.getenv("SF_REASON_MODEL", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
+# 评价 / 条文比对模型。默认用 4090 暴露的 AMD 网关上的 Qwen3.6-35B-A3B（快、免费、在 tencent loopback）。
+REASON_MODEL = os.getenv("SF_REASON_MODEL", "Qwen3.6-35B-A3B")
+# reason 模型走独立网关；默认 tencent 反向隧道 → 4090 接口。缺 key 时回落 OCR 网关。
+REASON_BASE_URL = os.getenv("SF_REASON_BASE_URL", "http://127.0.0.1:17590/v1").rstrip("/")
+REASON_API_KEY = os.getenv("SF_REASON_API_KEY", "")
 _TIMEOUT = float(os.getenv("SF_TIMEOUT", "120"))
 # 5xx / 超时重试次数与退避（秒）。
 _RETRIES = int(os.getenv("SF_RETRIES", "2"))
@@ -48,10 +54,10 @@ class LLMError(RuntimeError):
     """硅基流动调用失败（网络、鉴权、上游错误等）。"""
 
 
-def _headers() -> dict:
+def _headers(api_key: str = SF_API_KEY) -> dict:
     h = {"Content-Type": "application/json"}
-    if SF_API_KEY:
-        h["Authorization"] = f"Bearer {SF_API_KEY}"
+    if api_key:
+        h["Authorization"] = f"Bearer {api_key}"
     return h
 
 
@@ -76,14 +82,14 @@ def prepare_image(raw: bytes, content_type: str | None = None) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
-async def _chat(payload: dict) -> dict:
-    """带重试的 chat/completions 调用，返回 message 字典。"""
+async def _chat(payload: dict, *, base_url: str = SF_BASE_URL, api_key: str = SF_API_KEY) -> dict:
+    """带重试的 chat/completions 调用，返回 message 字典。可指定网关 base/key。"""
     last: Exception | None = None
     for attempt in range(_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 resp = await client.post(
-                    f"{SF_BASE_URL}/chat/completions", headers=_headers(), json=payload
+                    f"{base_url}/chat/completions", headers=_headers(api_key), json=payload
                 )
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]
@@ -91,7 +97,7 @@ async def _chat(payload: dict) -> dict:
             code = e.response.status_code if e.response is not None else 0
             body = e.response.text[:200] if e.response is not None else ""
             last = LLMError(f"{payload.get('model')} 返回 {code}: {body}")
-            if code not in (429, 500, 502, 503, 504):
+            if code not in (429, 500, 502, 503, 504, 524):
                 raise last from e
         except (httpx.HTTPError, KeyError, IndexError) as e:
             last = LLMError(f"{payload.get('model')} 调用失败: {e}")
@@ -103,6 +109,53 @@ async def _chat(payload: dict) -> dict:
 def _msg_text(msg: dict) -> str:
     """取 message 正文；推理模型可能把答案放在 reasoning_content。"""
     return (msg.get("content") or msg.get("reasoning_content") or "").strip()
+
+
+async def _chat_stream(payload: dict, *, base_url: str, api_key: str) -> str:
+    """流式 chat/completions，返回拼接后的正文 content。
+
+    推理型模型（Qwen3.6）思考 + 正文可能耗时 ~2 分钟，非流式会因代理/CF 空闲
+    超时被掐断（RemoteDisconnected / 524）。流式边生成边收，连接不空闲，稳定得多。
+    只累计 content（正文），思考过程 reasoning 丢弃。
+    """
+    payload = {**payload, "stream": True}
+    last: Exception | None = None
+    for attempt in range(_RETRIES + 1):
+        content_parts: list[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                async with client.stream(
+                    "POST", f"{base_url}/chat/completions",
+                    headers=_headers(api_key), json=payload,
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            delta = json.loads(data)["choices"][0]["delta"]
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+            text = "".join(content_parts).strip()
+            if text:
+                return text
+            last = LLMError("流式响应未返回正文 content")
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 0
+            last = LLMError(f"{payload.get('model')} 返回 {code}")
+            if code not in (429, 500, 502, 503, 504, 524):
+                raise last from e
+        except (httpx.HTTPError, KeyError, IndexError) as e:
+            last = LLMError(f"{payload.get('model')} 流式调用失败: {e}")
+        if attempt < _RETRIES:
+            await asyncio.sleep(_RETRY_BACKOFF * (attempt + 1))
+    raise last or LLMError("流式调用失败")
 
 
 async def ocr(model: str, image_data_url: str, *, max_tokens: int = 3000) -> str:
@@ -137,20 +190,38 @@ async def ocr_all(image_data_url: str) -> list[dict]:
     return list(await asyncio.gather(*(one(m) for m in OCR_MODELS)))
 
 
-async def reason_json(system: str, user: str, *, max_tokens: int = 4000) -> dict:
-    """用推理模型做一次返回 JSON 的调用。"""
-    msg = await _chat(
+async def reason_json(
+    system: str, user: str, *, images: list[str] | None = None, max_tokens: int = 20000
+) -> dict:
+    """用评价/比对模型做一次返回 JSON 的调用（流式，走 reason 网关，默认 4090 Qwen3.6）。
+
+    Qwen3.6 是推理 + 视觉模型：思考(reasoning)可能上万 token，正文(content)在其后。
+    用流式避免长响应被代理/CF 空闲超时掐断；max_tokens 给足以容纳思考+正文。
+    若传入 images（data URL 列表），则一并作为视觉输入，让模型以原图为准核对文本。
+    """
+    # reason 网关未单独配 key 时回落到 OCR 网关（硅基流动）的 base/key。
+    base = REASON_BASE_URL if REASON_API_KEY else SF_BASE_URL
+    key = REASON_API_KEY or SF_API_KEY
+    if images:
+        user_content: list[dict] = [{"type": "text", "text": user}]
+        for url in images:
+            user_content.append({"type": "image_url", "image_url": {"url": url}})
+    else:
+        user_content = user  # 纯文本
+    text = await _chat_stream(
         {
             "model": REASON_MODEL,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": user_content},
             ],
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
-        }
+        },
+        base_url=base,
+        api_key=key,
     )
-    return _parse_json(_msg_text(msg))
+    return _parse_json(text)
 
 
 def _parse_json(text: str) -> dict:

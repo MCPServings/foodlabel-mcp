@@ -180,14 +180,16 @@ def eval_system() -> str:
 
 
 def analyze_system() -> str:
-    """DeepSeek-R1 把标签文本逐条对照 GB 国标、输出问题/风险/缺失点的系统提示词。"""
+    """把标签原图+OCR 草稿逐条对照 GB 国标、输出问题/风险/缺失点的系统提示词。"""
     return "\n".join(
         [
-            "你是中国食品标签合规审查专家。用户给出一份从预包装食品标签识别出的文本。",
+            "你是中国食品标签合规审查专家。用户会给出一件预包装食品标签的**原始照片**，"
+            "以及 OCR 初步识别出的**文本草稿**（可能有错漏）。",
             f"请对照现行国家标准逐条详尽比对：{STANDARDS}。",
             "",
             "要求：",
-            "1) 先从文本中提取结构化字段（见 extracted）；识别不到的留空，**不要臆造**。",
+            "0) **以原图为准**：OCR 草稿仅供参考，若与图片不符或有遗漏，以你从图片中看到的为准。",
+            "1) 先从标签中提取结构化字段（见 extracted）；识别不到的留空，**不要臆造**。",
             "2) 对下面每一条强制检查项给出判定，并**引用具体标准条款**说明依据：",
             "   status 取值：pass=满足；fail=明确违反或缺失强制项；warn=表述不规范/疑似问题需复核；"
             "na=对本商品不适用（如进口食品豁免许可证/标准代号、属营养标签豁免类别）；"
@@ -217,17 +219,20 @@ def analyze_system() -> str:
             '    "other_text":""',
             "  },",
             '  "checks": [',
-            '    {"id":"name","category":"GB7718","item":"食品名称","status":"pass",',
-            '     "finding":"结合标签文本的具体说明","basis":"GB 7718-2025 4.2"}, ...',
+            "    // 只列出**有问题或不适用**的检查项（status 为 fail/warn/na/unknown）；",
+            "    // 满足要求(pass)的项不必列出，系统会自动补全为 pass。",
+            '    {"id":"date","category":"GB7718","item":"日期标示","status":"fail",',
+            '     "finding":"结合标签文本的具体说明","basis":"GB 7718-2025 4.7"}, ...',
             "  ],",
             '  "missing":  [ {"item":"缺失项","detail":"说明","basis":"条款","suggestion":"整改建议"}, ... ],',
             '  "problems": [ {"item":"问题项","detail":"说明","basis":"条款","suggestion":"整改建议"}, ... ],',
             '  "risks":    [ {"item":"风险项","detail":"说明","level":"high|medium|low","basis":"条款","suggestion":"整改建议"}, ... ],',
             '  "summary": {"verdict":"compliant|issues|non_compliant|not_a_label",',
-            '              "pass":0,"fail":0,"warn":0,"score":0}   // score 0-100，越高越合规',
+            '              "score":0}   // score 0-100，越高越合规',
             "}",
             "",
-            'checks 必须覆盖清单中每个 id。若文本明显不是食品标签：is_food_label=false，'
+            'checks 只需列出有问题/不适用的项（用清单里的 id），不必逐项复述。'
+            '若文本明显不是食品标签：is_food_label=false，'
             'verdict="not_a_label"。所有文字用简体中文。',
         ]
     )
