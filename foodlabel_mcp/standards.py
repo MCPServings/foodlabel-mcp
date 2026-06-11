@@ -148,60 +148,87 @@ NUTRITION_EXEMPTIONS = (
 )
 
 
-def system_prompt() -> str:
-    """构造视觉模型的系统提示词，内含完整检查清单与输出 JSON 规范。"""
-    lines = [
-        "你是中国食品标签合规审查助手。用户上传一张或多张预包装食品**标签照片**"
-        "（可能是正面、背面、配料/营养面等，合起来是同一件商品）。",
-        f"对照现行国家标准判定其标签是否合规：{STANDARDS}。",
-        "",
-        "工作分两步：",
-        "1) 识读：尽量准确地从图片中提取所有可见的标签文字与营养成分表数据；图片"
-        "模糊或被遮挡导致看不清的字段，标为空并在该项判定中说明“图片不清/未拍到”。",
-        "2) 判定：对下面每一条强制检查项给出结论。**不要臆造图片中不存在的内容**；"
-        "拿不准或图片缺失就用 unknown，不要硬判 pass。",
-        "",
-        "每项判定的 status 取值：",
-        "  pass = 标签满足该项要求；",
-        "  fail = 明确违反或明确缺失该强制项；",
-        "  warn = 可能存在问题或表述不规范，需人工复核；",
-        "  na   = 该项对本商品不适用（如进口食品豁免许可证/标准代号、属营养标签豁免类别）；",
-        "  unknown = 图片看不清或未拍到，无法判断。",
-        "",
-        "营养标签豁免参考：" + NUTRITION_EXEMPTIONS,
-        "",
-        "强制检查清单（逐项判定，basis 为标准条款，须原样回填）：",
-    ]
-    for c in CHECKLIST:
-        lines.append(
-            f"- [{c['id']}] {c['item']}（{c['basis']}）：{c['requirement']}"
-        )
-    lines += [
-        "",
-        "只输出一个 JSON 对象（不要 markdown、不要解释文字），结构如下：",
-        "{",
-        '  "is_food_label": true/false,        // 图片是否为食品标签',
-        '  "label_type": "如：预包装食品标签/进口食品/营养标签豁免类 等",',
-        '  "extracted": {                       // 识读到的字段，无则空字符串',
-        '    "food_name":"", "ingredients":"", "additives":"", "net_content":"",',
-        '    "spec":"", "producer":"", "address":"", "contact":"",',
-        '    "production_date":"", "shelf_life":"", "expiry_date":"", "storage":"",',
-        '    "license_no":"", "standard_code":"", "quality_grade":"",',
-        '    "allergens":"", "claims":"",',
-        '    "nutrition_warning":"",            // 若有“儿童青少年应避免过量摄入盐油糖”回填原文',
-        '    "nutrition_table":[ {"name":"能量","value":"1234kJ","nrv":"15%"}, ... ],',
-        '    "other_text":""                    // 其他重要可见文字',
-        "  },",
-        '  "checks": [                           // 必须覆盖清单中每个 id',
-        '    {"id":"name","category":"GB7718","item":"食品名称","status":"pass",',
-        '     "finding":"具体说明","basis":"GB 7718-2025 4.2"}, ...',
-        "  ],",
-        '  "summary": {"verdict":"compliant|issues|non_compliant|not_a_label",',
-        '              "pass":0,"fail":0,"warn":0,"score":0},   // score 0-100，越高越合规',
-        '  "suggestions": ["针对 fail/warn 项给出可执行的整改建议", ...]',
-        "}",
-        "",
-        "若图片明显不是食品标签：is_food_label=false，summary.verdict=\"not_a_label\"，"
-        "checks 可为空，并在 suggestions 说明原因。所有文字用简体中文。",
-    ]
-    return "\n".join(lines)
+def _checklist_text() -> str:
+    return "\n".join(
+        f"- [{c['id']}] {c['item']}（{c['basis']}）：{c['requirement']}" for c in CHECKLIST
+    )
+
+
+def eval_system() -> str:
+    """DeepSeek-R1 评价各 OCR 结果质量、并合并出最佳标签文本的系统提示词。"""
+    return "\n".join(
+        [
+            "你是中文 OCR 质量评审与文本融合专家。用户会给出**同一张预包装食品标签图片**"
+            "由多个 OCR 模型分别识别出的文本。",
+            "请完成两件事：",
+            "1) 逐个评价每份 OCR 结果的质量（完整性、准确性、是否有乱码/幻觉/缺行），"
+            "给 0-100 的可信度分数与简要说明；",
+            "2) 综合所有结果，去除明显乱码与幻觉，融合出一份**最完整、最可信**的标签文本"
+            "（保留原文用词、数字、单位、标点，按版面顺序分行）。",
+            "不要臆造任何 OCR 结果中都没有出现的内容。所有文字用简体中文。",
+            "",
+            "只输出一个 JSON 对象：",
+            "{",
+            '  "evaluations": [',
+            '    {"model":"模型名","score":0-100,"comment":"质量评价","issues":["发现的问题",...]}, ...',
+            "  ],",
+            '  "merged_text": "融合后的最佳标签全文（含换行）",',
+            '  "confidence": 0-100   // 对融合文本整体可信度的判断',
+            "}",
+        ]
+    )
+
+
+def analyze_system() -> str:
+    """DeepSeek-R1 把标签文本逐条对照 GB 国标、输出问题/风险/缺失点的系统提示词。"""
+    return "\n".join(
+        [
+            "你是中国食品标签合规审查专家。用户给出一份从预包装食品标签识别出的文本。",
+            f"请对照现行国家标准逐条详尽比对：{STANDARDS}。",
+            "",
+            "要求：",
+            "1) 先从文本中提取结构化字段（见 extracted）；识别不到的留空，**不要臆造**。",
+            "2) 对下面每一条强制检查项给出判定，并**引用具体标准条款**说明依据：",
+            "   status 取值：pass=满足；fail=明确违反或缺失强制项；warn=表述不规范/疑似问题需复核；"
+            "na=对本商品不适用（如进口食品豁免许可证/标准代号、属营养标签豁免类别）；"
+            "unknown=文本信息不足无法判断。",
+            "3) 在 problems / risks / missing 三类里给出**详尽**的问题点：",
+            "   - missing（缺失点）：强制标示内容缺失（如缺生产日期、缺某营养素、缺致敏物提示等）；",
+            "   - problems（问题点）：标示了但不规范/不符合条款要求（如日期格式、声称用语、定量标示等）；",
+            "   - risks（风险点）：可能引发监管处罚或消费者误导的隐患（如夸大宣传、暗示功效、误导性图文等）。",
+            "   每条都要尽量指出对应标准条款与整改建议。",
+            "",
+            "营养标签豁免参考：" + NUTRITION_EXEMPTIONS,
+            "",
+            "强制检查清单（basis 为标准条款，须原样回填）：",
+            _checklist_text(),
+            "",
+            "只输出一个 JSON 对象（不要 markdown、不要解释文字）：",
+            "{",
+            '  "is_food_label": true/false,',
+            '  "label_type": "如：预包装食品标签/进口食品/营养标签豁免类 等",',
+            '  "extracted": {',
+            '    "food_name":"", "ingredients":"", "additives":"", "net_content":"",',
+            '    "spec":"", "producer":"", "address":"", "contact":"",',
+            '    "production_date":"", "shelf_life":"", "expiry_date":"", "storage":"",',
+            '    "license_no":"", "standard_code":"", "quality_grade":"",',
+            '    "allergens":"", "claims":"", "nutrition_warning":"",',
+            '    "nutrition_table":[ {"name":"能量","value":"1234kJ","nrv":"15%"}, ... ],',
+            '    "other_text":""',
+            "  },",
+            '  "checks": [',
+            '    {"id":"name","category":"GB7718","item":"食品名称","status":"pass",',
+            '     "finding":"结合标签文本的具体说明","basis":"GB 7718-2025 4.2"}, ...',
+            "  ],",
+            '  "missing":  [ {"item":"缺失项","detail":"说明","basis":"条款","suggestion":"整改建议"}, ... ],',
+            '  "problems": [ {"item":"问题项","detail":"说明","basis":"条款","suggestion":"整改建议"}, ... ],',
+            '  "risks":    [ {"item":"风险项","detail":"说明","level":"high|medium|low","basis":"条款","suggestion":"整改建议"}, ... ],',
+            '  "summary": {"verdict":"compliant|issues|non_compliant|not_a_label",',
+            '              "pass":0,"fail":0,"warn":0,"score":0}   // score 0-100，越高越合规',
+            "}",
+            "",
+            'checks 必须覆盖清单中每个 id。若文本明显不是食品标签：is_food_label=false，'
+            'verdict="not_a_label"。所有文字用简体中文。',
+        ]
+    )
+

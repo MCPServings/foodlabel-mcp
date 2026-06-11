@@ -1,9 +1,15 @@
-"""框架无关的核心：食品标签 → 视觉模型识读 → 国标合规判定 → 规范化报告.
+"""框架无关的核心：食品标签 → 双 OCR 识别 → R1 评价合并 → R1 国标比对 → 规范化报告.
 
 本模块不依赖任何 Web 框架，便于被 FastAPI 后端与 MCP server 共同复用：
 
   * FastAPI 后端（server/app.py）解析 multipart 后调用本模块。
   * MCP server 直接以 data URL / base64 调用本模块。
+
+流程：
+  1) PaddleOCR-VL-1.5 与 DeepSeek-OCR 并行识别图片文字；
+  2) DeepSeek-R1-0528-Qwen3-8B 评价各 OCR 结果质量并融合出最佳文本；
+  3) DeepSeek-R1 把融合文本逐条对照 GB 7718-2025 / GB 28050-2025，
+     输出 checks 与 missing / problems / risks（缺失/问题/风险点）。
 
 校验类错误统一抛 InputError（上层映射为 400）；模型/网络错误由 llm.LLMError
 向上抛（上层映射为 502）。
@@ -11,7 +17,7 @@
 from __future__ import annotations
 
 from . import llm
-from .standards import CHECKLIST, system_prompt
+from .standards import CHECKLIST, analyze_system, eval_system
 
 # 允许的图片 MIME 类型。
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"}
@@ -59,11 +65,64 @@ async def check_image_bytes(
 
 
 async def analyze_data_urls(data_urls: list[str]) -> dict:
-    """从已就绪的 data URL 列表开始，调用模型并规范化结果。"""
+    """三段式流程：双 OCR 并行 → R1 评价融合 → R1 国标比对 → 规范化。"""
     if not data_urls:
         raise InputError("没有可分析的图片。")
-    result = await llm.analyze(data_urls, system_prompt())
-    return normalize(result)
+
+    # 1) 多 OCR 模型并行识别（对每张图都跑；多图时各图结果按模型拼接）。
+    per_image = []
+    for url in data_urls:
+        per_image.append(await llm.ocr_all(url))
+    # 汇总成 [{model, text, error}]，多图时同模型文本用分隔符拼接。
+    ocr_results: list[dict] = []
+    for idx, model in enumerate(llm.OCR_MODELS):
+        texts, errs = [], []
+        for img_res in per_image:
+            r = next((x for x in img_res if x["model"] == model), None)
+            if not r:
+                continue
+            if r.get("error"):
+                errs.append(r["error"])
+            if r.get("text"):
+                texts.append(r["text"])
+        ocr_results.append(
+            {
+                "model": model,
+                "text": "\n\n---\n\n".join(texts),
+                "error": "; ".join(errs) if errs and not texts else None,
+            }
+        )
+
+    if not any(r["text"] for r in ocr_results):
+        # 所有 OCR 都失败：直接报错，附带各自的错误。
+        detail = "; ".join(f"{r['model']}: {r['error']}" for r in ocr_results if r.get("error"))
+        raise llm.LLMError(f"OCR 全部失败：{detail or '无文本'}")
+
+    # 2) R1 评价各 OCR 结果并融合最佳文本。
+    eval_user = "以下是同一张食品标签图片的多个 OCR 识别结果：\n\n" + "\n\n".join(
+        f"【{r['model']}】\n{r['text'] or '(无输出' + (' / ' + r['error'] if r.get('error') else '') + ')'}"
+        for r in ocr_results
+    )
+    evaluation = await llm.reason_json(eval_system(), eval_user, max_tokens=4000)
+    merged_text = (evaluation.get("merged_text") or "").strip()
+    if not merged_text:
+        # 评价模型没给融合文本时，退而用最长的一份 OCR 文本。
+        merged_text = max((r["text"] for r in ocr_results), key=len, default="")
+
+    # 3) R1 对融合文本逐条对照国标，输出 checks 与 缺失/问题/风险点。
+    analyze_user = "以下是某预包装食品标签识别出的文本，请逐条对照国家标准进行合规分析：\n\n" + merged_text
+    analysis = await llm.reason_json(analyze_system(), analyze_user, max_tokens=6000)
+
+    result = normalize(analysis)
+    # 附上 OCR 原文与评价，供前端展示「识别过程」。
+    result["ocr_results"] = ocr_results
+    result["ocr_evaluation"] = {
+        "evaluations": evaluation.get("evaluations", []),
+        "confidence": evaluation.get("confidence"),
+    }
+    result["merged_text"] = merged_text
+    return result
+
 
 
 def normalize(result: dict) -> dict:
@@ -113,5 +172,9 @@ def normalize(result: dict) -> dict:
             summary["verdict"] = "compliant"
     result["summary"] = summary
     result.setdefault("extracted", {})
+    # 三类问题点：缺失 / 问题 / 风险。保证为列表，便于前端稳定渲染。
+    for key in ("missing", "problems", "risks"):
+        v = result.get(key)
+        result[key] = v if isinstance(v, list) else []
     result.setdefault("suggestions", [])
     return result

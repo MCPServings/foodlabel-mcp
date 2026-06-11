@@ -1,7 +1,8 @@
 """foodlabel-mcp — 食品标签国标合规检查 MCP server.
 
-把"上传食品标签图片 → 视觉大模型识读 → 对照 GB 7718-2025 / GB 28050-2025
-强制项判定"的能力封装为 MCP 工具，供任意 MCP 客户端（Claude Desktop、IDE 等）调用。
+把"食品标签图片 → 双 OCR 识别 → DeepSeek-R1 评价融合 → 对照
+GB 7718-2025 / GB 28050-2025 逐条比对，输出缺失/问题/风险点"的能力
+封装为 MCP 工具，供任意 MCP 客户端（Claude Desktop、IDE 等）调用。
 
 工具：
   * check_food_label(images)  对一张/多张标签图片做合规检查，返回结构化报告
@@ -9,10 +10,11 @@
 
 图片入参支持：data URL（data:image/...;base64,xxx）、http(s) 图片 URL、或纯 base64。
 
-配置（环境变量，与后端共用）：
-  LLM_BASE_URL  默认 https://tianshu-gateway.cloud/v1
-  LLM_API_KEY   网关 bearer key（必填）
-  LLM_MODEL     默认 OpenAI/GPT-5.5
+配置（环境变量，与后端共用，硅基流动 SiliconFlow）：
+  SF_BASE_URL     默认 https://api.siliconflow.cn/v1
+  SF_API_KEY      硅基流动 key（必填）
+  SF_OCR_MODELS   默认 PaddlePaddle/PaddleOCR-VL-1.5,deepseek-ai/DeepSeek-OCR
+  SF_REASON_MODEL 默认 deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 传输方式：MCP_TRANSPORT=stdio（默认）| sse | streamable-http
 """
 from __future__ import annotations
