@@ -1,17 +1,18 @@
-"""多模型客户端：OCR 走硅基流动，评价/比对走天枢（均 OpenAI 兼容）.
+"""模型客户端：OCR 与识读/评价均走硅基流动（OpenAI 兼容）.
 
 封装两类调用：
 
-  * ocr_all(image)        并行跑多个 OCR 视觉模型（硅基流动 PaddleOCR-VL-1.5 / DeepSeek-OCR）
-  * reason_json(...)      用评价/比对模型做返回 JSON 的调用（默认 4090 接口 Qwen3.6-35B-A3B）
+  * ocr_all(image)        并行跑 OCR 视觉模型（硅基流动 DeepSeek-OCR）识别标签文字
+  * reason_json(...)      用识读/评价模型做返回 JSON 的调用（默认硅基流动 Qwen/Qwen3-8B）
 
 配置（环境变量）：
     SF_BASE_URL        OCR 网关，默认 https://api.siliconflow.cn/v1
     SF_API_KEY         OCR 网关 key（硅基流动，必填）
-    SF_OCR_MODELS      逗号分隔的 OCR 模型，默认 PaddlePaddle/PaddleOCR-VL-1.5,deepseek-ai/DeepSeek-OCR
-    SF_REASON_MODEL    评价/比对模型，默认 Qwen3.6-35B-A3B
-    SF_REASON_BASE_URL 评价/比对网关，默认 http://127.0.0.1:17590/v1（tencent 反向隧道→4090 AMD 网关）
-    SF_REASON_API_KEY  评价/比对网关 key；留空则回落用 SF_API_KEY/SF_BASE_URL
+    SF_OCR_MODELS      逗号分隔的 OCR 模型，默认 deepseek-ai/DeepSeek-OCR
+    SF_REASON_MODEL    识读/评价模型，默认 Qwen/Qwen3-8B
+    SF_REASON_BASE_URL 识读/评价网关，默认 https://api.siliconflow.cn/v1
+    SF_REASON_API_KEY  识读/评价网关 key；留空则回落用 SF_API_KEY/SF_BASE_URL
+    SF_REASON_NO_THINK 关闭模型思考（Qwen3 等），默认 1（关）。关思考更快更稳。
     SF_TIMEOUT         秒，默认 120
 """
 from __future__ import annotations
@@ -34,11 +35,14 @@ OCR_MODELS = [
     ).split(",")
     if m.strip()
 ]
-# 评价 / 条文比对模型。默认用 4090 暴露的 AMD 网关上的 Qwen3.6-35B-A3B（快、免费、在 tencent loopback）。
-REASON_MODEL = os.getenv("SF_REASON_MODEL", "Qwen3.6-35B-A3B")
-# reason 模型走独立网关；默认 tencent 反向隧道 → 4090 接口。缺 key 时回落 OCR 网关。
-REASON_BASE_URL = os.getenv("SF_REASON_BASE_URL", "http://127.0.0.1:17590/v1").rstrip("/")
+# 识读 / 评价模型。默认硅基流动 Qwen/Qwen3-8B（免费、关思考约 90s、与 OCR 同网关）。
+REASON_MODEL = os.getenv("SF_REASON_MODEL", "Qwen/Qwen3-8B")
+# reason 网关；默认与 OCR 同走硅基流动。缺 key 时回落 OCR 网关 base/key。
+REASON_BASE_URL = os.getenv("SF_REASON_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 REASON_API_KEY = os.getenv("SF_REASON_API_KEY", "")
+# 关闭模型思考（硅基流动 Qwen3 等支持 chat_template_kwargs.enable_thinking=false）。
+# 关思考更快更稳；不支持的网关会忽略此参数，加了无害。
+_REASON_NO_THINK = os.getenv("SF_REASON_NO_THINK", "1") == "1"
 _TIMEOUT = float(os.getenv("SF_TIMEOUT", "120"))
 # 5xx / 超时重试次数与退避（秒）。
 _RETRIES = int(os.getenv("SF_RETRIES", "2"))
@@ -191,13 +195,13 @@ async def ocr_all(image_data_url: str) -> list[dict]:
 
 
 async def reason_json(
-    system: str, user: str, *, images: list[str] | None = None, max_tokens: int = 20000
+    system: str, user: str, *, images: list[str] | None = None, max_tokens: int = 16000
 ) -> dict:
-    """用评价/比对模型做一次返回 JSON 的调用（流式，走 reason 网关，默认 4090 Qwen3.6）。
+    """用识读/评价模型做一次返回 JSON 的调用（流式，走 reason 网关，默认硅基流动 Qwen3-8B）。
 
-    Qwen3.6 是推理 + 视觉模型：思考(reasoning)可能上万 token，正文(content)在其后。
-    用流式避免长响应被代理/CF 空闲超时掐断；max_tokens 给足以容纳思考+正文。
-    若传入 images（data URL 列表），则一并作为视觉输入，让模型以原图为准核对文本。
+    用流式避免长响应被代理/CF 空闲超时掐断。默认关思考（_REASON_NO_THINK），
+    输出更快更稳；max_tokens 上限给足以容纳较长的 JSON 报告（及可能的思考预算）。
+    images（data URL 列表）仅在 reason 模型支持视觉时有效；纯文本模型（如 Qwen3-8B）请勿传。
     """
     # reason 网关未单独配 key 时回落到 OCR 网关（硅基流动）的 base/key。
     base = REASON_BASE_URL if REASON_API_KEY else SF_BASE_URL
@@ -208,19 +212,18 @@ async def reason_json(
             user_content.append({"type": "image_url", "image_url": {"url": url}})
     else:
         user_content = user  # 纯文本
-    text = await _chat_stream(
-        {
-            "model": REASON_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        },
-        base_url=base,
-        api_key=key,
-    )
+    payload = {
+        "model": REASON_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    if _REASON_NO_THINK:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    text = await _chat_stream(payload, base_url=base, api_key=key)
     return _parse_json(text)
 
 

@@ -1,14 +1,15 @@
-"""框架无关的核心：食品标签 → 双 OCR 识别 → R1 评价合并 → R1 国标比对 → 规范化报告.
+"""框架无关的核心：食品标签 → OCR 识别 → 文本识读 → 适用规则 → 国标比对 → 规范化报告.
 
 本模块不依赖任何 Web 框架，便于被 FastAPI 后端与 MCP server 共同复用：
 
   * FastAPI 后端（server/app.py）解析 multipart 后调用本模块。
   * MCP server 直接以 data URL / base64 调用本模块。
 
-流程：
-  1) PaddleOCR-VL-1.5 与 DeepSeek-OCR 并行识别图片文字；
-  2) DeepSeek-R1-0528-Qwen3-8B 评价各 OCR 结果质量并融合出最佳文本；
-  3) DeepSeek-R1 把融合文本逐条对照 GB 7718-2025 / GB 28050-2025，
+流程（analyze_steps 分步生成器）：
+  1) DeepSeek-OCR 识别图片文字；
+  2) Qwen3-8B 据 OCR 文本识读出结构化字段与营养成分表；
+  3) Qwen3-8B 受限分类出食品类目 → 代码确定性映射各项适用/豁免；
+  4) Qwen3-8B 基于适用规则逐条对照 GB 7718-2025 / GB 28050-2025，
      输出 checks 与 missing / problems / risks（缺失/问题/风险点）。
 
 校验类错误统一抛 InputError（上层映射为 400）；模型/网络错误由 llm.LLMError
@@ -118,13 +119,15 @@ async def analyze_steps(data_urls: list[str]):
     ocr_draft = "\n\n".join(r["text"] for r in ocr_results if r["text"])
     yield {"step": 1, "stage": "ocr", "status": "done", "ocr_results": ocr_results}
 
-    # ── 步骤 2：视觉识读字段 + 营养表 ──
+    # ── 步骤 2：基于 OCR 文本识读字段 + 营养表 ──
     yield {"step": 2, "stage": "extract", "status": "started", "label": "识读内容"}
+    if not ocr_draft:
+        raise llm.LLMError("OCR 未识别出任何文本，无法识读标签字段。")
     extract_user = (
-        "请识读这张食品标签，输出结构化字段 JSON。"
-        + ("\n\n供参考的 OCR 文本草稿：\n" + ocr_draft if ocr_draft else "")
+        "以下是某食品标签由 OCR 识别出的文本，请据此整理出结构化字段 JSON：\n\n"
+        + ocr_draft
     )
-    extracted_doc = await llm.reason_json(extract_system(), extract_user, images=data_urls)
+    extracted_doc = await llm.reason_json(extract_system(), extract_user)
     extracted = extracted_doc.get("extracted") or {}
     is_label = extracted_doc.get("is_food_label")
     label_type = extracted_doc.get("label_type", "")
