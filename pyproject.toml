@@ -3,6 +3,8 @@ name = "foodlabel-mcp"
 version = "0.1.0"
 description = "MCP server: check prepackaged-food label images against China GB 7718-2025 / GB 28050-2025"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "MCPServings" }]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",

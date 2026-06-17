@@ -57,3 +57,9 @@ foodlabel-mcp                    # stdio（默认）
 | `LLM_MODEL` | `OpenAI/GPT-5.5` | 视觉模型 |
 | `LLM_TEMPERATURE` | 空 | 推理型模型留空；非推理型可设 0.1 |
 | `MCP_TRANSPORT` | `stdio` | `stdio` / `sse` / `streamable-http` |
+
+---
+
+## License
+
+MIT © MCPServings. See [LICENSE](LICENSE).
